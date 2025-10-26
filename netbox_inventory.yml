@@ -1,0 +1,5 @@
+plugin: netbox.netbox.nb_inventory
+config_context: false
+group_by:
+  - device_roles
+

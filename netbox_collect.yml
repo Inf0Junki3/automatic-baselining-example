@@ -1,0 +1,160 @@
+---
+- name: Collect the inventory of all my assets
+  hosts: all
+  vars:
+    netbox_url: "{{ lookup('ansible.builtin.env', 'NETBOX_API') }}"
+    netbox_token: "{{ lookup('ansible.builtin.env', 'NETBOX_API_KEY') }}"
+
+  pre_tasks:
+    - name: Ensure network facts (for tcp_listen)
+      ansible.builtin.setup:
+        gather_subset:
+          - network
+      when: ansible_facts.tcp_listen is not defined
+
+    - name: Determine primary IP (prefer IPv4 then IPv6)
+      ansible.builtin.set_fact:
+        primary_ip: >-
+          {{ (ansible_facts.get('default_ipv4', {}).get('address'))
+             | default(ansible_facts.get('default_ipv6', {}).get('address'), true) }}
+
+    - name: Sanity check primary IP
+      ansible.builtin.assert:
+        that:
+          - primary_ip is string
+          - primary_ip | length > 0
+        fail_msg: "Could not determine primary IP (default_ipv4/default_ipv6)."
+
+  tasks:
+    - name: Gather info about listening ports
+      become: true
+      become_user: root
+      community.general.listen_ports_facts:
+        command: 'ss'
+
+    - name: Fetch NetBox services filtered by exact IP (server-side) via nb_lookup
+      vars:
+        _nb_args:
+          api_endpoint: "{{ netbox_url }}"
+          token: "{{ netbox_token }}"
+          validate_certs: true
+          # NetBox 4.3.6 supports filtering services by ipaddress
+          api_filter: "ipaddress={{ primary_ip }}&limit=0"
+      ansible.builtin.set_fact:
+        nb_services_raw: >-
+          {{ lookup('netbox.netbox.nb_lookup', 'services',
+                    api_endpoint=_nb_args.api_endpoint,
+                    token=_nb_args.token,
+                    validate_certs=_nb_args.validate_certs,
+                    api_filter=_nb_args.api_filter) }}
+
+    - name: (Resilience) If the server-side filter errored, fall back to all services (client-side filter)
+      block:
+        - name: No-op (nb_services_raw already set)
+          ansible.builtin.debug:
+            msg: "Server-side filter result length: {{ nb_services_raw | length }}"
+          changed_when: false
+      rescue:
+        - name: Fallback – fetch all services via nb_lookup
+          vars:
+            _nb_args_all:
+              api_endpoint: "{{ netbox_url }}"
+              token: "{{ netbox_token }}"
+              validate_certs: true
+          ansible.builtin.set_fact:
+            nb_services_raw: >-
+              {{ lookup('netbox.netbox.nb_lookup', 'services',
+                        api_endpoint=_nb_args_all.api_endpoint,
+                        token=_nb_args_all.token,
+                        validate_certs=_nb_args_all.validate_certs) }}
+
+    - name: Normalize NetBox services to {(ip, 'tcp', port)} for this host
+      ansible.builtin.set_fact:
+        nb_tcp_set: "{{ nb_services_raw | normalize_netbox_services(primary_ip) }}"
+
+    - name: Build non-loopback listeners list
+      ansible.builtin.set_fact:
+        non_loopback_listeners: >-
+          {{
+            (ansible_facts.tcp_listen + ansible_facts.udp_listen)
+            | selectattr('address', 'defined')
+            | rejectattr('address', 'match', '^(127.)')
+            | rejectattr('address', 'match', '^(::1)')
+            | rejectattr('port', 'match', '^(68)')
+            | list
+          }}
+
+    - name: Normalize local tcp_listen to {(ip, 'tcp', port)} (wildcards match primary IP)
+      ansible.builtin.set_fact:
+        host_tcp_set: "{{ ansible_facts.tcp_listen | normalize_tcp_listen(primary_ip) }}"
+
+    - name: Compute diff
+      ansible.builtin.set_fact:
+        tcp_diff: "{{ nb_tcp_set | diff_listens(host_tcp_set) }}"
+
+    - name: Show nb_services
+      ansible.builtin.debug:
+        var: nb_services_raw
+
+    - name: Show tcp_services
+      ansible.builtin.debug:
+        var: host_tcp_set 
+
+    - name: Show diff (structured)
+      ansible.builtin.debug:
+        var: tcp_diff
+
+    - name: Create the device that corresponds to my asset
+      delegate_to: localhost
+      netbox.netbox.netbox_device:
+        netbox_url:  "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        data:
+          name: "{{ lookup('community.general.dig', ansible_facts['default_ipv4']['address'] + '/PTR')[:-1] }}"
+          device_type: vm
+          device_role: vm
+          site: Home
+      register: device_lookup
+
+    - name: Create the interface that corresponds to my asset
+      delegate_to: localhost
+      netbox.netbox.netbox_device_interface:
+        netbox_url:  "{{ netbox_url }}"
+        netbox_token: "{{ netbox_token }}"
+        data:
+          name : "{{ ansible_facts['default_ipv4']['interface'] }}"
+          type: 1000Base-T
+          device: "{{ lookup('community.general.dig', ansible_facts['default_ipv4']['address'] + '/PTR')[:-1] }}"
+
+    - name: Create or update the IP address of my asset
+      delegate_to: localhost
+      inf0junki3.inventory.netbox_ip_assign:
+        netbox_url:  "{{ netbox_url }}"
+        token: "{{ netbox_token }}"
+        device: "{{ lookup('community.general.dig', ansible_facts['default_ipv4']['address'] + '/PTR')[:-1] }}"
+        interface: "{{ ansible_facts['default_ipv4']['interface'] }}"
+        address: "{{ ansible_facts['default_ipv4']['address'] }}/24"
+        dns_name: "{{ lookup('community.general.dig', ansible_facts['default_ipv4']['address'] + '/PTR')[:-1] }}"
+        status: active
+ 
+    - name: Catalog ports
+      delegate_to: localhost
+      ansible.builtin.uri:
+        url: "{{ netbox_url }}/api/ipam/services/"
+        method: POST
+        headers:
+          Authorization: "Token {{ netbox_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "{{ item['name'] }}"
+          parent_object_type: "dcim.device"
+          parent_object_id: "{{ device_lookup.device.id }}"
+          ports: "[{{ item['port'] }}]"
+          protocol: "{{ item['protocol'] }}"
+
+        status_code:
+          - 200
+          - 201
+      loop: "{{ tcp_diff['unexpected_on_host'] | unique }}"
+
